@@ -1,0 +1,91 @@
+---
+title: "LCClean"
+author: "Eric Voss"
+date: "9/21/2020"
+output: html_document
+---
+
+```{r loadPackagesAndData}
+if(!require(tidyverse)){install.packages('tidyverse');require(tidyverse)}
+options(dplyr.summarise.inform = FALSE)
+if(!require(caret)){install.packages('caret');require(caret)}
+dataSet = read_csv('LoanStats3a.csv')
+```
+
+Some initial data exploration
+```{r EDA}
+dim(dataSet)
+table(sapply(dataSet[1,],class))
+```
+
+Let's look for missing values.
+```{r missing}
+ggplot_missing <- function(x){
+	if(!require(reshape2)){warning('you need to install reshape2')}
+	require(reshape2)
+	#### This function produces a plot of the missing data pattern
+	#### in x.  It is a modified version of a function in the 'neato' package
+  x %>% 
+    is.na %>%
+    melt %>%
+    ggplot(data = .,
+           aes(x = Var2,
+               y = Var1)) +
+    geom_raster(aes(fill = value)) +
+    scale_fill_grey(name = "",
+                    labels = c("Present","Missing")) +
+    theme_minimal() + 
+    theme(axis.text.x  = element_text(angle=45, vjust=0.5)) + 
+    labs(x = "Variables in Dataset",
+         y = "Rows / observations")
+}
+ggplot_missing(dataSet)
+```
+
+There's quite a bit of missing data there - I'll remove features with entirely missing data, as I can't do anything with those, and then look at what's left.
+```{r}
+dataSet = dataSet[,colSums(is.na(dataSet))<nrow(dataSet)]
+table(sapply(dataSet,class))
+```
+
+First idea: let's take a look at "purpose", which looks to be a factor with 15 levels, and see if we can use other features to build a classifier for it. This could be useful for, say, targeted advertising to potential customers which specifically mentions loan purposes which might be relevant to them. To that end, I'm going to take a subset of this data which excludes features that wouldn't be available for prospects who aren't yet customers. Some of these fields, like loan amount, could be highly predictive, but wouldn't actually be useful in building this model from a business perspective.
+
+```{r}
+dataSetReduced = dataSet %>%
+  select(purpose, home_ownership, annual_inc, zip_code, addr_state,delinq_2yrs,delinq_amnt,
+         earliest_cr_line,inq_last_6mths,mths_since_last_delinq,mths_since_last_record,open_acc,
+         pub_rec,pub_rec_bankruptcies,revol_bal,revol_util,total_acc,acc_now_delinq,
+         chargeoff_within_12_mths,tax_liens)
+sapply(dataSetReduced, function(x)length(unique(x)))
+sapply(dataSetReduced,function(x){sum(is.na(x))})
+```
+
+We have to decide what to do with these missing values in the data. Fortunately, most of these features have very few missing values, so removing those entries should have a minimal impact. 2 features stand out to me here - mths_since_last_record, and mths_since_last_delinq. I'd like to look at these features more closely.
+
+
+```{r}
+unique(dataSetReduced$mths_since_last_delinq)
+unique(dataSetReduced$mths_since_last_record)
+```
+
+Since these features measure the length of time since the last event of interest (delinquincies and public records), the missing values seem to indicate that the event has never happened. This makes it tricky to know what to do with these missing values - there are too many to remove, but since we're counting up from 0 months since last incidence, what number should represent never having one? To solve this, I am choosing to label missing values as simply the max value +1, as I feel this is a better solution than removing these missing values or these feature altogether.
+
+```{r}
+m = is.na(dataSetReduced$mths_since_last_delinq)
+dataSetReduced$mths_since_last_delinq[m] = max(dataSetReduced$mths_since_last_delinq,na.rm = TRUE)+1
+m = is.na(dataSetReduced$mths_since_last_record)
+dataSetReduced$mths_since_last_record[m] = max(dataSetReduced$mths_since_last_record,na.rm = TRUE)+1
+```
+
+Now, let's drop the rest of our missing value records:
+```{r}
+dataSetReduced = drop_na(dataSetReduced)
+sapply(dataSetReduced,function(x){sum(is.na(x))})
+```
+
+
+
+
+
+
+
