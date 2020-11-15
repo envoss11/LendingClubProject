@@ -9,6 +9,9 @@ output: html_document
 if(!require(tidyverse)){install.packages('tidyverse');require(tidyverse)}
 options(dplyr.summarise.inform = FALSE)
 if(!require(caret)){install.packages('caret');require(caret)}
+if(!require(ranger)){install.packages('ranger');require(ranger)}
+if(!require(xgboost)){install.packages('xgboost');require(xgboost)}
+if(!require(pROC)){install.packages('pROC');require(pROC)}
 dataSet = read_csv('LoanStats3a.csv')
 ```
 
@@ -48,14 +51,18 @@ dataSet = dataSet[,colSums(is.na(dataSet))<nrow(dataSet)]
 table(sapply(dataSet,class))
 ```
 
-First idea: let's take a look at "purpose", which looks to be a factor with 15 levels, and see if we can use other features to build a classifier for it. This could be useful for, say, targeted advertising to potential customers which specifically mentions loan purposes which might be relevant to them. To that end, I'm going to take a subset of this data which excludes features that wouldn't be available for prospects who aren't yet customers. Some of these fields, like loan amount, could be highly predictive, but wouldn't actually be useful in building this model from a business perspective.
+Project goal: let's take a look at "purpose", which looks to be a factor with 15 levels, and see if we can use other features to build a classifier for it. This could be useful for, say, targeted advertising to potential customers which specifically mentions loan purposes which might be relevant to them. To that end, I'm going to take a subset of this data which excludes features that wouldn't be available for prospects who aren't yet customers. Some of these fields, like loan amount, could be highly predictive, but wouldn't actually be useful in building this model from a business perspective.
 
 ```{r}
+#dataSetReduced = dataSet %>%
+  #select(purpose, home_ownership, annual_inc, zip_code, addr_state,delinq_2yrs,delinq_amnt,
+  #       earliest_cr_line,inq_last_6mths,mths_since_last_delinq,mths_since_last_record,open_acc,
+  #       pub_rec,pub_rec_bankruptcies,revol_bal,revol_util,total_acc,acc_now_delinq,
+  #       chargeoff_within_12_mths,tax_liens)
 dataSetReduced = dataSet %>%
-  select(purpose, home_ownership, annual_inc, zip_code, addr_state,delinq_2yrs,delinq_amnt,
-         earliest_cr_line,inq_last_6mths,mths_since_last_delinq,mths_since_last_record,open_acc,
-         pub_rec,pub_rec_bankruptcies,revol_bal,revol_util,total_acc,acc_now_delinq,
-         chargeoff_within_12_mths,tax_liens)
+  select(purpose, home_ownership, annual_inc,delinq_2yrs,
+         inq_last_6mths,mths_since_last_delinq,mths_since_last_record,open_acc,
+         pub_rec,pub_rec_bankruptcies,revol_bal,revol_util,total_acc)
 sapply(dataSetReduced, function(x)length(unique(x)))
 sapply(dataSetReduced,function(x){sum(is.na(x))})
 ```
@@ -68,24 +75,115 @@ unique(dataSetReduced$mths_since_last_delinq)
 unique(dataSetReduced$mths_since_last_record)
 ```
 
-Since these features measure the length of time since the last event of interest (delinquincies and public records), the missing values seem to indicate that the event has never happened. This makes it tricky to know what to do with these missing values - there are too many to remove, but since we're counting up from 0 months since last incidence, what number should represent never having one? To solve this, I am choosing to label missing values as simply the max value +1, as I feel this is a better solution than removing these missing values or these feature altogether.
+Since these features measure the length of time since the last event of interest (delinquincies and public records), the missing values seem to indicate that the event has never happened. I will be recoding these into qualititative features with 2 levels to indicate if the individual has ever had a delinquincy/public record.
 
 ```{r}
 m = is.na(dataSetReduced$mths_since_last_delinq)
-dataSetReduced$mths_since_last_delinq[m] = max(dataSetReduced$mths_since_last_delinq,na.rm = TRUE)+1
-m = is.na(dataSetReduced$mths_since_last_record)
-dataSetReduced$mths_since_last_record[m] = max(dataSetReduced$mths_since_last_record,na.rm = TRUE)+1
+dataSetReduced$mths_since_last_delinq[m==TRUE] = 0
+dataSetReduced$mths_since_last_delinq[m==FALSE] = 1
+n = is.na(dataSetReduced$mths_since_last_record)
+dataSetReduced$mths_since_last_record[n==TRUE] = 0
+dataSetReduced$mths_since_last_record[n==FALSE] = 1
 ```
 
-Now, let's drop the rest of our missing value records:
+Now, I'll drop the rest of our missing value records, and do some conversion/fixing of data types:
 ```{r}
 dataSetReduced = drop_na(dataSetReduced)
-sapply(dataSetReduced,function(x){sum(is.na(x))})
+
+#Remove the % sign and convert to numeric for revol_util
+dataSetReduced$revol_util = gsub('.{1}$', '', dataSetReduced$revol_util)
+dataSetReduced$revol_util = (as.numeric(dataSetReduced$revol_util))
+#Convert purpose to factor and use one-hot encoding on home_ownership
+dataSetReduced$home_ownership = as.factor(dataSetReduced$home_ownership)
+dataSetReducedTemp = dataSetReduced[,-1]
+dmy <- dummyVars(" ~ .", data = dataSetReducedTemp)
+dataSetReducedTemp <- data.frame(predict(dmy, newdata = dataSetReducedTemp))
+dataSetReducedTemp$purpose = as.factor(dataSetReduced$purpose)
+dataSetReduced = dataSetReducedTemp
+summary(dataSetReduced$purpose)
+```
+
+I'm noticing here that we have a somewhat imbalanced classifier - around half our records have a "debt consolidation" classification. This may present an issue going forward.
+
+Applying a training/test split:
+```{r}
+Y = dataSetReduced$purpose
+X = select(dataSetReduced, -purpose)
+set.seed(1)
+trainSplit = createDataPartition(y = Y, p = 0.8, list = FALSE)
+
+Ytrain = Y[trainSplit]
+Xtrain = X[trainSplit,]
+Ytest  = Y[-trainSplit]
+Xtest  = X[-trainSplit,]
+training = dataSetReduced[ trainSplit,]
+testing = dataSetReduced[-trainSplit,]
+```
+
+```{r}
+trControl = trainControl(method = "cv", number = 5)
+```
+
+First, I will try out KNN to classify Purpose. This requires some preprocessing.
+```{r}
+tuneGrid = expand.grid(k = c(1,2,10,50,100,150,200))
+knnOut = train(x = Xtrain, y = Ytrain, method = "knn", tuneGrid = tuneGrid, trControl = trControl,preProcess = c("center","scale"))
+```
+
+Looking at the results from knn:
+```{r}
+YhatKnn = predict(knnOut, Xtest)
+table(YhatKnn, Ytest)
+```
+
+Indeed, the imbalanced classifier is an issue - KNN is more or less predicting debt_conolidation for everything. In addition, we probably have too few data points relative to the number of features for KNN to be effective. I will try a decision tree method going forward, which may handle this issue better.
+
+First, I'm going to rework the supervisor to narrow my focus into classifying between "debt consolidation" and "single purpose" (e.g. home repair, education, etc.) loans.
+```{r}
+levels(Ytrain)[levels(Ytrain)!="debt_consolidation"] = "single_purpose"
+levels(Ytest)[levels(Ytest)!="debt_consolidation"] = "single_purpose"
+```
+
+Here, I'm trying a pruned classification tree
+```{r}
+tuneGrid = expand.grid(cp = c(0.0001,0.001, 0.01, 0.1))
+rpartOut = train(x = Xtrain, y = Ytrain,
+                  method = "rpart",
+                  tuneGrid = tuneGrid,
+                  trControl = trControl)
+plot(rpartOut$finalModel,margin= rep(.1,4))
+text(rpartOut$finalModel, cex = 0.4, digits = 1)
 ```
 
 
+Next, I'm going to try a Random Forest method.
+```{r}
+set.seed(1)
+tuneGridRf     = data.frame(mtry = round(sqrt(ncol(Xtrain))))
+rfOut      = train(x = Xtrain, y = Ytrain,
+                   method = "rf",
+                   tuneGrid = tuneGridRf,
+                   trControl = trControl)
+```
 
+Now let's take a look at these results with an ROC curve and a confusion matrix:
+```{r}
+YhatRf = predict(rfOut, Xtest)
+YhatRfProbs = predict(rfOut, Xtest,type="prob")
+YhatRPartProbs = predict(rpartOut, Xtest,type="prob")
+YhatRpart = predict(rpartOut, Xtest)
 
+table(YhatRf, Ytest)
+table(YhatRpart, Ytest)
 
+rocCurve = roc(Ytest, YhatRfProbs$single_purpose)
+rocCurve2 = roc(Ytest, YhatRPartProbs$single_purpose)
+plot(rocCurve, legacy.axes=TRUE)
+lines(rocCurve2, col = 'red')
+legend(x=0,y = 1,legend=c("Class. Tree","Random Forest"),col=c("red","black"),lty=1,cex=0.8)
 
+confusionMatrix(reference = Ytest, data = YhatRf)
+confusionMatrix(reference = Ytest, data = YhatRpart)
+```
 
+Now we're getting much more sensible results with both of these models, though the bagging seems to give slightly better accuracy and specificity.
