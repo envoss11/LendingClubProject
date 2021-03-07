@@ -2,7 +2,9 @@
 title: "LCClean"
 author: "Eric Voss"
 date: "9/21/2020"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r loadPackagesAndData, include=FALSE}
@@ -12,8 +14,13 @@ if(!require(caret)){install.packages('caret');require(caret)}
 if(!require(ranger)){install.packages('ranger');require(ranger)}
 if(!require(xgboost)){install.packages('xgboost');require(xgboost)}
 if(!require(pROC)){install.packages('pROC');require(pROC)}
+if(!require(e1071)){install.packages('e1071');require(e1071)}
+if(!require(randomForest)){install.packages('randomForest');require(randomForest)}
+
 dataSet = read_csv('LoanStats3a.csv')
 ```
+
+In this file, we will be performing some exploratory data analysis and data cleaning.
 
 ```{r EDA}
 dim(dataSet)
@@ -46,12 +53,13 @@ ggplot_missing(dataSet)
 ```
 
 There's quite a bit of missing data there - I'll remove features with entirely missing data, as I can't do anything with those, and then look at what's left.
+
 ```{r}
 dataSet = dataSet[,colSums(is.na(dataSet))<nrow(dataSet)]
 table(sapply(dataSet,class))
 ```
 
-My goal with this project: let's take a look at "purpose", which looks to be a factor with 15 levels, and see if we can use other features to build a classifier for it. This could be useful for, say, targeted advertising to potential customers which specifically mentions loan purposes which might be relevant to them. To that end, I'm going to take a subset of this data which excludes features that wouldn't be available for prospects who aren't yet customers. Some of these fields, like loan amount, could be highly predictive, but wouldn't actually be useful in building this model from a business perspective.
+Some motivation for this project: let's take a look at "purpose", which looks to be a factor with 15 levels, and see if we can use other features to build a classifier for it. This could be useful for, say, targeted advertising to potential customers which specifically mentions loan purposes which might be relevant to them. To that end, I'm going to take a subset of this data which excludes features that wouldn't be available for prospects who aren't yet customers. Some of these fields, like loan amount, could be highly predictive, but wouldn't actually be useful in building this model from a business perspective (obviously, if a customer has already applied for a loan of a specific amount, we already know what their purpose is).
 
 ```{r}
 dataSetReduced = dataSet %>%
@@ -63,7 +71,6 @@ sapply(dataSetReduced,function(x){sum(is.na(x))})
 ```
 
 We have to decide what to do with these missing values in the data. Fortunately, most of these features have very few missing values, so removing those entries should have a minimal impact. 2 features stand out to me here - mths_since_last_record, and mths_since_last_delinq. I'd like to look at these features more closely.
-
 
 ```{r}
 unique(dataSetReduced$mths_since_last_delinq)
@@ -96,9 +103,10 @@ dataSetReducedTemp <- data.frame(predict(dmy, newdata = dataSetReducedTemp))
 dataSetReducedTemp$purpose = as.factor(dataSetReduced$purpose)
 dataSetReduced = dataSetReducedTemp
 summary(dataSetReduced$purpose)
+
 ```
 
-I'm noticing here that we have a somwhat imbalanced classifier - around half our records have a "debt consolidation" classification. This may present an issue going forward.
+I'm noticing here that we have a somewhat imbalanced classifier - around half our records have a "debt consolidation" classification. This may present an issue going forward.
 
 Applying a training/test split:
 ```{r}
@@ -120,20 +128,21 @@ trControl = trainControl(method = "cv", number = 5)
 ```
 
 First, I will try out KNN to classify Purpose. This requires some preprocessing.
-```{r}
+```{r, cache = TRUE}
 tuneGrid = expand.grid(k = c(1,2,10,50,100,150,200))
 knnOut = train(x = Xtrain, y = Ytrain, method = "knn", tuneGrid = tuneGrid, trControl = trControl,preProcess = c("center","scale"))
 ```
 
 Looking at the results from knn:
-```{r}
+```{r, cache = TRUE}
 YhatKnn = predict(knnOut, Xtest)
 table(YhatKnn, Ytest)
 ```
 
-Indeed, the imbalanced classifier is an issue - KNN is more or less predicting debt_conolidation for everything. In addition, we probably have too few data points relative to the number of features for KNN to be effective. I will try a decision tree method going forward, which may handle this issue better.
+Indeed, the imbalanced classifier is an issue - KNN is more or less predicting debt_conolidation for everything. In addition, it turns out we have too few data points relative to the number of features for KNN to be effective. I will try a decision tree method going forward, which may handle this issue better.
 
-First, I'm going to rework the supervisor to narrow my focus into classifying between "debt consolidation" and "single purpose" (e.g. home repair, education, etc.) loans. After some consideration of what we might be trying to acheive with this project, I decided that this split would be much easier to use while still providing considerable business value. The problem of marketing debt consolidation products to debt-laden consumers is, in some ways, the polar opposite of trying to market products designed to increase the purchasing power of consumers without as much existing debt to worry about, so distinguishing between these two categories of consumers is critical.
+First, I'm going to rework the supervisor to narrow my focus into classifying between "debt consolidation" and "single purpose" (e.g. home repair, education, etc.) loans. After some consideration of what we might be trying to acheive with this project, I decided that this split would be much easier to use while still providing considerable business value. The problem of marketing debt consolidation products to debt-laden consumers is, in some ways, the polar opposite of trying to market products designed to increase the purchasing power of consumers without as much existing debt to worry about, so distinguishing between these two categories of consumers is valuable.
+
 ```{r}
 levels(Ytrain)[levels(Ytrain)!="debt_consolidation"] = "single_purpose"
 levels(Ytest)[levels(Ytest)!="debt_consolidation"] = "single_purpose"
@@ -141,8 +150,8 @@ Ytrain = relevel(Ytrain,"debt_consolidation")
 Ytest = relevel(Ytest,"debt_consolidation")
 ```
 
-Here, I'm trying a pruned classification tree
-```{r}
+Here, I'm trying a classification tree with pruning
+```{r, cache= TRUE}
 tuneGrid = expand.grid(cp = c(0.0001,0.001, 0.01, 0.1))
 rpartOut = train(x = Xtrain, y = Ytrain,
                   method = "rpart",
@@ -152,9 +161,8 @@ plot(rpartOut$finalModel,margin= rep(.1,4))
 text(rpartOut$finalModel, cex = 0.4, digits = 1)
 ```
 
-
-Next, I'm going to try a Random Forest method, followed by a boosting method.
-```{r}
+Next, I'm going to try a Random Forest method (bagging), followed by a boosting method.
+```{r, cache = TRUE}
 set.seed(1)
 tuneGridRf     = data.frame(mtry = round(sqrt(ncol(Xtrain))))
 rfOut      = train(x = Xtrain, y = Ytrain,
@@ -180,7 +188,7 @@ boostOut   = train(x = Xtrain, y = Ytrain,
 ```
 
 Now let's take a look at these results with some ROC curves. I'm also going to look at various decision thresholds for each model.
-```{r}
+```{r, cache = TRUE}
 YhatRfProbs = predict(rfOut, Xtest,type="prob")
 YhatRPartProbs = predict(rpartOut, Xtest,type="prob")
 YhatBoostProbs = predict(boostOut, Xtest,type="prob")
@@ -205,13 +213,13 @@ lines(rocCurve, col = 'black')
 legend(x=0,y = 0.5,legend=c("Class. Tree","Random Forest","Xgboost"),col=c("red","black","green"),lty=1,cex=0.8)
 ```
 
-These classifiers all perform fairly similarly. For this hypothetical business problem, I am assuming the marginal cost of trying to sell a debt consolidation product to someone who is not interested is fairly low, so I'm going to use the ROC curve above to choose a lower threshold than the default of 0.5.
+These classifiers all perform fairly similarly. For this hypothetical business problem, I am going to choose the default of 0.5 as a threshold to maximize accuracy.
 
 ```{r}
 
-YhatRf = as.factor(ifelse(YhatRfProbs[,2] >= 0.44,"debt_consolidation","single_purpose")) #Get Yhats using threshold of 0.44 instead
-YhatRpart = as.factor(ifelse(YhatRPartProbs[,1] >= 0.432,"debt_consolidation","single_purpose"))
-YhatBoost = as.factor(ifelse(YhatBoostProbs[,2] >= 0.47,"debt_consolidation","single_purpose"))
+YhatRf = as.factor(ifelse(YhatRfProbs[,2] >= 0.5,"single_purpose","debt_consolidation")) #Get Yhats using threshold of 0.44 instead
+YhatRpart = as.factor(ifelse(YhatRPartProbs[,1] >= 0.5,"debt_consolidation","single_purpose"))
+YhatBoost = as.factor(ifelse(YhatBoostProbs[,2] >= 0.5,"single_purpose","debt_consolidation"))
 
 confusionMatrix(reference = Ytest, data = YhatRf)
 confusionMatrix(reference = Ytest, data = YhatRpart)
@@ -221,6 +229,7 @@ confusionMatrix(reference = Ytest, data = YhatBoost)
 Now we're getting much more useful results with these models.
 
 I would like to also look at which feature importance to see which data is most important in making these predictions.
+
 ```{r importance}
 boostImportance = xgb.importance(model = boostOut$finalModel) 
 rfImportance = data.frame(rfOut$finalModel$importance)
@@ -232,7 +241,7 @@ rpartImportance
 ```
 All three models agree that the 3 most overwhelmingly important features are revol_bal, revol_util, and annual_inc. This makes a lot of sense: revol_bal and revol_util tell us an individual's revolving balance and their balance relative to all available credit, respectively. These should be strongly predictive of an individual's need for debt consolidation. Income also would heavily impact the relative burden imposed by a given level of debt, so it's also expected that annual income is a highly important feature.
 
-Finally, I will choose a model to export which will be used in a Shiny app to help hypothetical employees of a company decide whether or not to send debt consolidation marketing materials to a potential customer. Based on its accuracy and high sensitivity, I will use the Xgboost model.
+Finally, I will choose a model to export which will be used in a Shiny app to help hypothetical employees of a company decide which marketing materials to send to a potential customer. Based on its accuracy (and since we aren't concerned with model interpretability for this problem), I will use the Xgboost model.
 
 ```{r}
 saveRDS(boostOut,"./final_model.rds")
